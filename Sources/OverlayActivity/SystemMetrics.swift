@@ -4,14 +4,32 @@ import IOKit
 
 final class SystemMetrics {
     private let host = mach_host_self()
+    private let gpuStatisticsProperty = "PerformanceStatistics" as CFString
+    // Prefer whole-device counters over individual GPU engines.
+    private let gpuUtilizationKeys: [NSString] = ["Device Utilization %", "GPU Activity(%)", "GPU Utilization %"]
     private var previousCPU: host_cpu_load_info_data_t?
+    private var accelerators: [io_service_t] = []
+    private var nextGPUDiscovery: TimeInterval = 0
+    private lazy var ramPageFraction: Double? = {
+        var pageSize: vm_size_t = 0
+        let capacity = ProcessInfo.processInfo.physicalMemory
+        guard capacity > 0, host_page_size(host, &pageSize) == KERN_SUCCESS else { return nil }
+        return Double(pageSize) / Double(capacity)
+    }()
 
     deinit {
+        releaseAccelerators()
         mach_port_deallocate(mach_task_self_, host)
     }
 
-    func resetCPU() {
+    func resetSampling() {
         previousCPU = nil
+        releaseAccelerators()
+        invalidateGPUDiscovery()
+    }
+
+    func invalidateGPUDiscovery() {
+        nextGPUDiscovery = 0
     }
 
     func cpuPercent() -> Int? {
@@ -39,27 +57,47 @@ final class SystemMetrics {
         return Int((100 * Double(busy) / Double(total)).rounded())
     }
 
-    func gpuPercent() -> Int? {
+    func gpuPercent(at uptime: TimeInterval) -> Int? {
+        if uptime >= nextGPUDiscovery {
+            // Recheck occasionally for a GPU change that didn't affect screen parameters.
+            nextGPUDiscovery = uptime + 30
+            discoverAccelerators()
+        }
+
+        var busiestGPU: Double?
+        for service in accelerators {
+            guard let stats = IORegistryEntryCreateCFProperty(
+                service, gpuStatisticsProperty, kCFAllocatorDefault, 0
+            )?.takeRetainedValue() as? NSDictionary else { continue }
+
+            for key in gpuUtilizationKeys {
+                guard let utilization = (stats[key] as? NSNumber)?.doubleValue,
+                      (0...100).contains(utilization) else { continue }
+                busiestGPU = max(busiestGPU ?? utilization, utilization)
+                break
+            }
+        }
+        return busiestGPU.map { Int($0.rounded()) }
+    }
+
+    private func discoverAccelerators() {
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) == KERN_SUCCESS else {
-            return nil
+            return
         }
         defer { IOObjectRelease(iterator) }
 
-        // Drivers expose different keys. Prefer whole-device counters over individual engines.
-        let keys = ["Device Utilization %", "GPU Activity(%)", "GPU Utilization %"]
-        var busiestGPU: Double?
+        releaseAccelerators()
         while case let service = IOIteratorNext(iterator), service != 0 {
-            defer { IOObjectRelease(service) }
-            guard let stats = IORegistryEntryCreateCFProperty(
-                service, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0
-            )?.takeRetainedValue() as? [String: Any] else { continue }
-
-            let readings = keys.lazy.compactMap { (stats[$0] as? NSNumber)?.doubleValue }
-            guard let utilization = readings.first(where: { $0.isFinite && (0...100).contains($0) }) else { continue }
-            busiestGPU = max(busiestGPU ?? utilization, utilization)
+            accelerators.append(service)
         }
-        return busiestGPU.map { Int($0.rounded()) }
+    }
+
+    private func releaseAccelerators() {
+        for service in accelerators {
+            IOObjectRelease(service)
+        }
+        accelerators.removeAll()
     }
 
     func ramPercent() -> Int? {
@@ -70,16 +108,12 @@ final class SystemMetrics {
                 host_statistics64(host, HOST_VM_INFO64, $0, &count)
             }
         }
-        var pageSize: vm_size_t = 0
-        let physicalMemory = ProcessInfo.processInfo.physicalMemory
-        guard result == KERN_SUCCESS, host_page_size(host, &pageSize) == KERN_SUCCESS, physicalMemory > 0 else {
-            return nil
-        }
+        guard result == KERN_SUCCESS, let ramPageFraction else { return nil }
 
         // Internal pages exclude file cache. Purgeable pages can be reclaimed on demand.
         let appPages = max(0, Int64(stats.internal_page_count) - Int64(stats.purgeable_count))
         let usedPages = appPages + Int64(stats.wire_count) + Int64(stats.compressor_page_count)
-        let used = Double(usedPages) * Double(pageSize) / Double(physicalMemory)
+        let used = Double(usedPages) * ramPageFraction
         return Int((min(used, 1) * 100).rounded())
     }
 }

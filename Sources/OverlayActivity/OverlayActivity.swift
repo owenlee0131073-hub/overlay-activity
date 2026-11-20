@@ -28,7 +28,12 @@ private final class OverlayController: NSObject, NSApplicationDelegate, NSMenuDe
     private let transparencyKey = "OverlayBackgroundTransparency"
     private var timer: Timer?
     private var overlayVisible = true
+    private var screensSleeping = false
     private var fpsEnabled = UserDefaults.standard.bool(forKey: "MeasureDisplayFPS")
+
+    private var monitoringScreen: NSScreen? {
+        overlayVisible && !screensSleeping ? NSScreen.screens.first : nil
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem.button?.image = NSImage(systemSymbolName: "gauge.with.dots.needle.50percent", accessibilityDescription: "Overlay Activity")
@@ -55,6 +60,7 @@ private final class OverlayController: NSObject, NSApplicationDelegate, NSMenuDe
             item.target = self
             menu.addItem(item)
         }
+        fpsItem.toolTip = "기본 디스플레이의 화면 갱신 빈도를 측정합니다."
         loginItem.target = self
         menu.addItem(loginItem)
         menu.addItem(.separator())
@@ -63,16 +69,25 @@ private final class OverlayController: NSObject, NSApplicationDelegate, NSMenuDe
         menu.addItem(quitItem)
         statusItem.menu = menu
 
-        NSWorkspace.shared.notificationCenter.addObserver(
+        let workspaceNotifications = NSWorkspace.shared.notificationCenter
+        workspaceNotifications.addObserver(
             self, selector: #selector(activeSpaceChanged(_:)),
             name: NSWorkspace.activeSpaceDidChangeNotification, object: nil
         )
-        showOverlay()
+        workspaceNotifications.addObserver(
+            self, selector: #selector(screenPowerChanged(_:)),
+            name: NSWorkspace.screensDidSleepNotification, object: nil
+        )
+        workspaceNotifications.addObserver(
+            self, selector: #selector(screenPowerChanged(_:)),
+            name: NSWorkspace.screensDidWakeNotification, object: nil
+        )
+        updateOverlay()
     }
 
     func applicationDidChangeScreenParameters(_ notification: Notification) {
-        positionOverlay()
-        configureFPS()
+        metrics.invalidateGPUDiscovery()
+        updateOverlay()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -81,6 +96,19 @@ private final class OverlayController: NSObject, NSApplicationDelegate, NSMenuDe
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        visibilityItem.title = overlayVisible ? "오버레이 숨기기" : "오버레이 표시"
+        fpsItem.title = fpsEnabled ? "FPS 측정 끄기" : "FPS 측정 켜기"
+        switch fpsEnabled ? fps.status : .off {
+        case .permissionRequired:
+            fpsHelpItem.title = "화면 기록 설정 열기"
+            fpsHelpItem.isHidden = false
+        case .unavailable:
+            fpsHelpItem.title = "FPS 측정 다시 시도"
+            fpsHelpItem.isHidden = false
+        case .off, .starting, .running:
+            fpsHelpItem.isHidden = true
+        }
+
         let status = SMAppService.mainApp.status
         loginItem.state = status == .enabled ? .on : .off
         loginItem.title = status == .requiresApproval ? "로그인 시 실행 승인…" : "로그인 시 실행"
@@ -110,19 +138,17 @@ private final class OverlayController: NSObject, NSApplicationDelegate, NSMenuDe
     }
 
     @objc private func activeSpaceChanged(_ notification: Notification) {
-        positionOverlay()
+        if let screen = monitoringScreen { positionOverlay(on: screen) }
+    }
+
+    @objc private func screenPowerChanged(_ notification: Notification) {
+        screensSleeping = notification.name == NSWorkspace.screensDidSleepNotification
+        updateOverlay()
     }
 
     @objc private func toggleOverlay() {
         overlayVisible.toggle()
-        if overlayVisible {
-            showOverlay()
-        } else {
-            timer?.invalidate()
-            timer = nil
-            panel.orderOut(nil)
-            configureFPS()
-        }
+        updateOverlay()
     }
 
     @objc private func toggleFPS() {
@@ -131,7 +157,7 @@ private final class OverlayController: NSObject, NSApplicationDelegate, NSMenuDe
         if fpsEnabled, !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess()
         }
-        configureFPS()
+        updateOverlay()
         panel.updateFPS(nil)
     }
 
@@ -154,72 +180,59 @@ private final class OverlayController: NSObject, NSApplicationDelegate, NSMenuDe
             NSWorkspace.shared.open(url)
             return
         }
-        configureFPS()
+        configureFPS(for: monitoringScreen)
     }
 
-    private func showOverlay() {
-        positionOverlay()
-        configureFPS()
-        metrics.resetCPU()
-        refresh()
+    private func updateOverlay() {
+        let screen = monitoringScreen
+        configureFPS(for: screen)
+        guard let screen else {
+            panel.orderOut(nil)
+            if let timer {
+                timer.invalidate()
+                self.timer = nil
+                metrics.resetSampling()
+            }
+            return
+        }
+        positionOverlay(on: screen)
 
-        let timer = Timer(timeInterval: 1, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
-        timer.tolerance = 0.1
+        let interval: TimeInterval = fpsEnabled ? 1 : 2
+        guard timer?.timeInterval != interval else { return }
+        if let timer { timer.invalidate() } else { refresh() }
+        let timer = Timer(timeInterval: interval, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
+        timer.tolerance = interval * 0.1
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
 
-    private func positionOverlay() {
-        guard overlayVisible else { return }
-        guard let screen = NSScreen.screens.first else {
-            panel.orderOut(nil)
-            return
-        }
+    private func positionOverlay(on screen: NSScreen) {
         let available = screen.visibleFrame
         let origin = NSPoint(x: available.maxX - panel.frame.width - 12, y: available.maxY - panel.frame.height - 10)
         panel.setFrameOrigin(origin)
         panel.orderFrontRegardless()
     }
 
-    private func configureFPS() {
-        let displayID = NSScreen.screens.first?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-        fps.configure(for: overlayVisible && fpsEnabled ? displayID?.uint32Value : nil)
-        updateMenu()
+    private func configureFPS(for screen: NSScreen?) {
+        let displayID = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+        fps.configure(for: fpsEnabled ? displayID?.uint32Value : nil)
     }
 
     @objc private func refresh() {
-        panel.update(cpu: metrics.cpuPercent(), gpu: metrics.gpuPercent(), ram: metrics.ramPercent())
-        panel.updateFPS(fps.sample())
-        updateMenu()
-    }
-
-    private func updateMenu() {
-        visibilityItem.title = overlayVisible ? "오버레이 숨기기" : "오버레이 표시"
-        fpsItem.title = fpsEnabled ? "FPS 측정 끄기" : "FPS 측정 켜기"
-        fpsItem.toolTip = "기본 디스플레이의 화면 갱신 빈도를 측정합니다."
-        fpsHelpItem.isHidden = true
-        if overlayVisible, fpsEnabled {
-            switch fps.status {
-            case .permissionRequired:
-                fpsHelpItem.title = "화면 기록 설정 열기"
-                fpsHelpItem.isHidden = false
-            case .unavailable:
-                fpsHelpItem.title = "FPS 측정 다시 시도"
-                fpsHelpItem.isHidden = false
-            case .off, .starting, .running:
-                break
-            }
-        }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if fpsEnabled { panel.updateFPS(fps.sample(at: uptime)) }
+        panel.update(cpu: metrics.cpuPercent(), gpu: metrics.gpuPercent(at: uptime), ram: metrics.ramPercent())
     }
 }
 
 @MainActor
 private final class OverlayPanel: NSPanel {
     private let background = NSView()
-    private let cpu = MetricCell("CPU")
-    private let gpu = MetricCell("GPU")
-    private let ram = MetricCell("RAM")
+    private let cpu = MetricCell("CPU", suffix: "%")
+    private let gpu = MetricCell("GPU", suffix: "%")
+    private let ram = MetricCell("RAM", suffix: "%")
     private let fps = MetricCell("FPS")
+    private lazy var row = NSStackView(views: [cpu, gpu, ram, fps])
 
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -243,14 +256,12 @@ private final class OverlayPanel: NSPanel {
         background.layer?.borderWidth = 1
         contentView = background
 
-        let row = NSStackView(views: [cpu, gpu, ram, fps])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.distribution = .fillEqually
         row.spacing = 0
         row.wantsLayer = true
         row.layer?.shadowColor = NSColor.black.cgColor
-        row.layer?.shadowOpacity = 0.9
         row.layer?.shadowRadius = 2
         row.layer?.shadowOffset = CGSize(width: 0, height: -1)
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -266,26 +277,31 @@ private final class OverlayPanel: NSPanel {
         let opacity = CGFloat(transparency.opacity)
         background.layer?.backgroundColor = NSColor(srgbRed: 0.075, green: 0.085, blue: 0.10, alpha: opacity).cgColor
         background.layer?.borderColor = NSColor(white: 1, alpha: 0.18 * opacity).cgColor
+        row.layer?.shadowOpacity = opacity < 0.5 ? 0.9 : 0
         hasShadow = opacity > 0
         invalidateShadow()
     }
 
     func update(cpu: Int?, gpu: Int?, ram: Int?) {
-        self.cpu.setUsage(cpu)
-        self.gpu.setUsage(gpu)
-        self.ram.setUsage(ram)
+        self.cpu.setValue(cpu)
+        self.gpu.setValue(gpu)
+        self.ram.setValue(ram)
     }
 
     func updateFPS(_ value: Int?) {
-        fps.setValue(value.map(String.init) ?? "–", level: .normal)
+        fps.setValue(value)
     }
 }
 
 @MainActor
 private final class MetricCell: NSStackView {
     private let valueLabel = NSTextField(labelWithString: "–")
+    private let suffix: String
+    private var value: Int?
+    private var level: UsageLevel = .normal
 
-    init(_ name: String) {
+    init(_ name: String, suffix: String = "") {
+        self.suffix = suffix
         super.init(frame: .zero)
         orientation = .vertical
         alignment = .centerX
@@ -302,13 +318,15 @@ private final class MetricCell: NSStackView {
 
     required init?(coder: NSCoder) { nil }
 
-    func setUsage(_ value: Int?) {
-        setValue(value.map { "\($0)%" } ?? "–", level: UsageLevel(percent: value))
-    }
+    func setValue(_ value: Int?) {
+        guard self.value != value else { return }
+        self.value = value
+        valueLabel.stringValue = value.map { "\($0)\(suffix)" } ?? "–"
+        guard !suffix.isEmpty else { return }
 
-    func setValue(_ text: String, level: UsageLevel) {
-        guard valueLabel.stringValue != text else { return }
-        valueLabel.stringValue = text
+        let level = UsageLevel(percent: value)
+        guard self.level != level else { return }
+        self.level = level
         switch level {
         case .normal:
             valueLabel.textColor = .white

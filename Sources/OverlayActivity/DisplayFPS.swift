@@ -25,6 +25,7 @@ final class DisplayFPS {
     }
 
     func configure(for displayID: CGDirectDisplayID?) {
+        if displayID == requestedDisplay, displayID == nil || status == .running { return }
         requestedDisplay = displayID
         if displayID == nil { captureStatus = .off }
         guard !transitioning else { return }
@@ -36,9 +37,9 @@ final class DisplayFPS {
         }
     }
 
-    func sample() -> Int? {
+    func sample(at uptime: TimeInterval) -> Int? {
         guard status == .running, let session, session.displayID == requestedDisplay else { return nil }
-        return session.output.sample()
+        return session.output.sample(at: uptime)
     }
 
     private func reconcileCapture() async {
@@ -73,8 +74,9 @@ final class DisplayFPS {
                 let excludedApps = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
                 let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
                 let configuration = SCStreamConfiguration()
-                configuration.width = 160
-                configuration.height = 90
+                // Only frame metadata is read, so a small output is enough at any refresh rate.
+                configuration.width = 64
+                configuration.height = 36
                 configuration.showsCursor = false
                 configuration.capturesAudio = false
 
@@ -96,8 +98,9 @@ final class DisplayFPS {
     }
 }
 
-private final class FrameCounter: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+final class FrameCounter: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let queue = DispatchQueue(label: "OverlayActivity.FrameCounter", qos: .utility)
+    private let statusKey = SCStreamFrameInfo.status.rawValue as NSString
     private let lock = NSLock()
     private var frames = 0
     private var lastSample: TimeInterval?
@@ -106,11 +109,16 @@ private final class FrameCounter: NSObject, SCStreamOutput, SCStreamDelegate, @u
     var didStop: Bool { lock.withLock { stopped } }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen else { return }
+        recordCompletedFrame(in: sampleBuffer)
+    }
+
+    func recordCompletedFrame(in sampleBuffer: CMSampleBuffer) {
         // Read the frame status only. The buffer's image is never accessed or retained.
-        guard type == .screen, sampleBuffer.isValid,
-              let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-              let status = attachments.first?[.status] as? Int,
-              status == SCFrameStatus.complete.rawValue else { return }
+        guard sampleBuffer.isValid,
+              let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false),
+              let metadata = (attachments as NSArray).firstObject as? NSDictionary,
+              (metadata[statusKey] as? NSNumber)?.intValue == SCFrameStatus.complete.rawValue else { return }
 
         lock.withLock { frames += 1 }
     }
@@ -119,15 +127,14 @@ private final class FrameCounter: NSObject, SCStreamOutput, SCStreamDelegate, @u
         lock.withLock { stopped = true }
     }
 
-    func sample() -> Int? {
+    func sample(at uptime: TimeInterval) -> Int? {
         lock.withLock {
-            let now = ProcessInfo.processInfo.systemUptime
             defer {
-                lastSample = now
+                lastSample = uptime
                 frames = 0
             }
-            guard let lastSample, now > lastSample, !stopped else { return nil }
-            return Int((Double(frames) / (now - lastSample)).rounded())
+            guard let lastSample, uptime > lastSample, !stopped else { return nil }
+            return Int((Double(frames) / (uptime - lastSample)).rounded())
         }
     }
 }

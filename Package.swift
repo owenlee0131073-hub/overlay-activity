@@ -8,5 +8,6 @@ let package = Package(
         .target(name: "OverlayCore"),
         .executableTarget(name: "OverlayActivity", dependencies: ["OverlayCore"]),
         .testTarget(name: "OverlayCoreTests", dependencies: ["OverlayCore"]),
+        .testTarget(name: "OverlayActivityTests", dependencies: ["OverlayActivity"]),
     ]
 )
