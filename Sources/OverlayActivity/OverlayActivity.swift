@@ -228,10 +228,10 @@ private final class OverlayController: NSObject, NSApplicationDelegate, NSMenuDe
 @MainActor
 private final class OverlayPanel: NSPanel {
     private let background = NSView()
-    private let cpu = MetricCell("CPU", suffix: "%")
-    private let gpu = MetricCell("GPU", suffix: "%")
-    private let ram = MetricCell("RAM", suffix: "%")
-    private let fps = MetricCell("FPS")
+    private let cpu = MetricCell("CPU", format: .gradientUsage)
+    private let gpu = MetricCell("GPU", format: .gradientUsage)
+    private let ram = MetricCell("RAM", format: .thresholdUsage)
+    private let fps = MetricCell("FPS", format: .count)
     private lazy var row = NSStackView(views: [cpu, gpu, ram, fps])
 
     override var canBecomeKey: Bool { false }
@@ -295,13 +295,29 @@ private final class OverlayPanel: NSPanel {
 
 @MainActor
 private final class MetricCell: NSStackView {
+    enum Format {
+        case gradientUsage, thresholdUsage, count
+
+        var suffix: String { self == .count ? "" : "%" }
+    }
+
+    private static let usageGradient = (0...100).map { percent in
+        let color = UsageColor.cpuGPU(percent: percent)
+        return NSColor(
+            srgbRed: CGFloat(color.red) / 255,
+            green: CGFloat(color.green) / 255,
+            blue: CGFloat(color.blue) / 255,
+            alpha: 1
+        )
+    }
+
     private let valueLabel = NSTextField(labelWithString: "–")
-    private let suffix: String
+    private let format: Format
     private var value: Int?
     private var level: UsageLevel = .normal
 
-    init(_ name: String, suffix: String = "") {
-        self.suffix = suffix
+    init(_ name: String, format: Format) {
+        self.format = format
         super.init(frame: .zero)
         orientation = .vertical
         alignment = .centerX
@@ -321,9 +337,19 @@ private final class MetricCell: NSStackView {
     func setValue(_ value: Int?) {
         guard self.value != value else { return }
         self.value = value
-        valueLabel.stringValue = value.map { "\($0)\(suffix)" } ?? "–"
-        guard !suffix.isEmpty else { return }
+        valueLabel.stringValue = value.map { "\($0)\(format.suffix)" } ?? "–"
 
+        switch format {
+        case .gradientUsage:
+            valueLabel.textColor = value.map { Self.usageGradient[min(100, max(0, $0))] } ?? .white
+        case .thresholdUsage:
+            updateThresholdColor(for: value)
+        case .count:
+            break
+        }
+    }
+
+    private func updateThresholdColor(for value: Int?) {
         let level = UsageLevel(percent: value)
         guard self.level != level else { return }
         self.level = level
